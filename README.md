@@ -12,6 +12,6 @@ explain install reason for yay packages
 - `yhy shell <pkg>` - install the given package, run `${SHELL}`, then uninstall
 
 ## database
-- json object found at $DB
+- json object found at `.local/share/yhy.json` (TODO: platform agnostic)
 - keys are package names
 - values are package reasons
