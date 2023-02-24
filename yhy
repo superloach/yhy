@@ -1,0 +1,231 @@
+#!/bin/bash
+
+set -e
+
+YAY=$(which yay)
+JQ=$(which jq)
+
+DB="$HOME/.local/share/yhy.json"
+TMP="$DB.tmp"
+
+function exit_ok() {
+	echo "ur all good :3"
+	kick_update_checker
+	exit 0
+}
+
+function load_db() {
+	if ! $JQ '.' "$DB" >/dev/null 2>&1; then
+		mv "$DB" "$DB.broken" >/dev/null 2>&1 || :
+		echo "old db moved to $DB.broken"
+		echo '{}' > "$DB"
+	fi
+
+	declare -ag PKGS=( )
+	declare -Ag YHY=( )
+
+	mapfile -t LINES < <($JQ -r 'to_entries[]|.key+":"+.value' "$DB"|sort)
+	# don't split line on space
+	for LINE in "${LINES[@]}"; do
+		PKG=$(cut -d: -f1 <<< "$LINE")
+		REASON=$(cut -d: -f2- <<< "$LINE")
+		PKGS+=( "$PKG" )
+		YHY[$PKG]=$REASON
+	done
+}
+
+function load_orphans() {
+	load_db
+
+	declare -ag ORPHANS=( )
+
+	mapfile -t UNREQ < <($YAY -Qttq)
+
+	for PKG in "${UNREQ[@]}"; do
+		if ! [ ${YHY[$PKG]+x} ]; then
+			ORPHANS+=( "$PKG" )
+		fi
+	done
+}
+
+function cmd_gone() {
+	load_db
+
+	mapfile -t HERE < <($YAY -Qttq)
+
+	declare -A HERE2=( )
+	for PKG in "${HERE[@]}"; do
+		HERE2[$PKG]="1"
+	done
+
+	declare -a GONE=( )
+	for PKG in "${!YHY[@]}"; do
+		if ! [ ${HERE2[$PKG]+x} ]; then
+			GONE+=( "$PKG" )
+		fi
+	done
+
+	if [ ${#GONE[@]} -eq 0 ]; then
+		exit_ok
+	fi
+
+	for PKG in "${GONE[@]}"; do
+		echo "$PKG: ${YHY[$PKG]}"
+	done | table
+}
+
+function cmd_help() {
+	cat << EOF
+yhy - yay why
+explain install reason for yay packages
+
+usage
+=====
+yhy
+# list packages not in the yhy database
+
+yhy list
+# list entries in the yhy database
+
+yhy gone
+# list uninstalled entries in the yhy database
+
+yhy add [pkg] [reason]
+# add/update an entry to the yhy database
+
+yhy del [pkg]
+# remove an entry from the yhy database
+
+yhy rename [oldpkg] [newpkg]
+# effectively add newpkg followed by del oldpkg
+
+yhy clean
+# recursively uninstall packages without reasons
+
+yhy shell [pkg]
+# install the given package, run \$SHELL, then uninstall
+
+database
+========
+json object found at $DB
+keys are package names
+values are package reasons
+EOF
+}
+
+function table() {
+	column -t -l 2
+}
+
+function cmd_show() {
+	load_orphans
+
+	if [ ${#ORPHANS[@]} -eq 0 ]; then
+		exit_ok
+	fi
+
+	for PKG in "${ORPHANS[@]}"; do
+		echo "$PKG ?"
+	done | table
+}
+
+function cmd_list() {
+	load_db
+
+	for PKG in "${PKGS[@]}"; do
+		REASON=${YHY[$PKG]}
+		echo "$PKG" "$REASON"
+	done | table
+}
+
+function tmp_update() {
+	mv "$TMP" "$DB"
+
+	kick_update_checker
+}
+
+function kick_update_checker() {
+	for p in $(pgrep -f yay-check-update); do
+		pkill sleep -P "$p" || :
+	done
+}
+
+function cmd_add() {
+	if ! $YAY -Q "$1" >/dev/null 2>&1; then
+		echo "package $1 doesn't seem to be installed"
+		return 1
+	fi
+
+	$JQ --arg pkg "$1" --arg reason "${*:2}" ".+{(\$pkg): (\$reason)}" "$DB" > "$TMP"
+
+	tmp_update
+
+	echo "added $1: ${*:2}"
+}
+
+function cmd_del() {
+	$JQ --arg pkg "$1" "del(.[\$pkg])" "$DB" > "$TMP"
+
+	tmp_update
+
+	echo "deleted $1"
+}
+
+function cmd_rename() {
+	OLDPKG=$1
+	NEWPKG=$2
+
+	load_db
+
+	REASON=${YHY[$OLDPKG]}
+
+	cmd_add $NEWPKG $REASON
+	cmd_del $OLDPKG
+}
+
+function cmd_clean() {
+	load_orphans
+
+	while [ ${#ORPHANS[@]} -gt 0 ]; do
+		$YAY -Rccs "${ORPHANS[@]}"
+
+		load_orphans
+	done
+
+	exit_ok
+}
+
+function cmd_shell() {
+	echo "warning: yhy shell does no sandboxing"
+
+	yes | $YAY -Sy --needed --noconfirm "$@"
+
+	SH=${SHELL:-$(which sh)}
+	echo "installed $*, running $SH"
+	$SH || echo "exited with code $?"
+
+	yes | $YAY -Rccs --noconfirm "$@"
+}
+
+# used by yay-check-update and status.py
+function cmd_orphan_count() {
+	load_orphans
+
+	echo ${#ORPHANS[@]}
+}
+
+if ! (return 0 2>/dev/null); then
+	ARGS=( "$@" )
+
+	if [[ "${#ARGS[@]}" == "0" ]]; then
+		ARGS+=( show )
+	fi
+
+	if [[ $(type -t "cmd_${ARGS[0]}") == function ]]; then
+		CMD=cmd_${ARGS[0]}
+		$CMD "${ARGS[@]:1}"
+	else
+		echo "unknown command ${ARGS[0]}"
+		cmd_help
+	fi
+fi
